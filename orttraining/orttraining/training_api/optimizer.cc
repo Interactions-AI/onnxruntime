@@ -40,33 +40,42 @@ Status Optimizer::ConstructInputs() {
   if (optimizer_type_ == OptimizerType::AdamW) {
     auto& param_named_optimizer_states = optimizer_state_.param_named_optimizer_states;
 
-    std::string param_name;
-    std::vector<std::string> param_names, grad_names, moment1_names, moment2_names, user_inputs;
-    for (size_t i = 2; i < input_names_.size(); i++) {
-      std::string& name = input_names_[i];
-      auto it = named_parameters_.find(name);
-      if (it != named_parameters_.end()) {  // is param
-        param_names.push_back(name);
-        inputs_.push_back(it->second->Data());
-      } else if (utils::GetParamNameFromGradient(name, param_name)) {
-        grad_names.emplace_back(name);
-        // assert param_name is valid.
-        auto it = named_parameters_.find(param_name);
-        ORT_ENFORCE(it != named_parameters_.end(), "Unknown param: ", param_name, " for field: ", name);
-        inputs_.push_back(it->second->Gradient());
-      } else if (utils::GetParamNameFromSuffix(name, MOMENT_SUFFIXES[0], param_name)) {
-        moment1_names.push_back(name);
-        auto it = named_parameters_.find(param_name);
-        ORT_ENFORCE(it != named_parameters_.end(), "Unknown param: ", param_name, " for field: ", name);
-        inputs_.push_back(param_named_optimizer_states.at(param_name).momentum_named_states.at(MOMENT_STATE_NAMES[0]));
-      } else if (utils::GetParamNameFromSuffix(name, MOMENT_SUFFIXES[1], param_name)) {
-        moment2_names.push_back(name);
-        auto it = named_parameters_.find(param_name);
-        ORT_ENFORCE(it != named_parameters_.end(), "Unknown param: ", param_name, " for field: ", name);
-        inputs_.push_back(param_named_optimizer_states.at(param_name).momentum_named_states.at(MOMENT_STATE_NAMES[1]));
+    std::vector<Tensor> params, first_order_moments, second_order_moments;
+    // TODO: Change to tensor seq implementation once clip grad norm op
+    // that accepts tensor seq as input for gradients is complete.
+    std::vector<OrtValue> grads;
+    for (auto& named_parameter : named_parameters_) {
+      params.emplace_back(std::move(*(named_parameter.second->Data().GetMutable<Tensor>())));
+      first_order_moments.emplace_back(std::move(*(param_named_optimizer_states.at(named_parameter.first).momentum_named_states.at(MOMENT_STATE_NAMES[0]).GetMutable<Tensor>())));
+      second_order_moments.emplace_back(std::move(*(param_named_optimizer_states.at(named_parameter.first).momentum_named_states.at(MOMENT_STATE_NAMES[1]).GetMutable<Tensor>())));
+    }
+
+    // Collect all the grad inputs
+    for (size_t i = 5; i < input_names_.size(); i++) {
+      std::string param_name;
+      if (utils::GetParamNameFromGradient(input_names_[i], param_name)) {
+        auto named_parameter_it = named_parameters_.find(param_name);
+        ORT_ENFORCE(named_parameter_it != named_parameters_.end(), "Unknown param: ", param_name, " for field: ", input_names_[i]);
+        grads.push_back(named_parameter_it->second->Gradient());
       } else {
-        ORT_ENFORCE("This is an invalid graph. Optimizer graph contains unknown user input:", name);
+        ORT_ENFORCE(false, "This is an invalid graph. Optimizer graph contains unknown user input:", input_names_[i]);
       }
+    }
+
+    auto input_inserter = [](auto& tensors, auto* inputs) {
+      ORT_ENFORCE(!tensors.empty(), "Tensors cannot be empty while building a tensor sequence.");
+      TensorSeq tensor_seq(tensors.front().DataType());
+      tensor_seq.SetElements(std::move(tensors));
+      inputs->emplace_back(std::move(OrtValue(&tensor_seq, DataTypeImpl::GetType<TensorSeq>(), DataTypeImpl::GetType<TensorSeq>()->GetDeleteFunc())));
+    };
+
+    input_inserter(params, &inputs_);
+    input_inserter(first_order_moments, &inputs_);
+    input_inserter(second_order_moments, &inputs_);
+
+    // add the gradients as ortvalues to inputs
+    for (auto& grad : grads) {
+      inputs_.push_back(grad);
     }
   }
   // Add other optimizer reordering logic here
@@ -85,8 +94,11 @@ Optimizer::Optimizer(const std::string& optim_path_or_bytes,
   ORT_THROW_IF_ERROR(optim_sess_->Initialize());
 
   utils::GetGraphInputOutputNames(optim_sess_, input_names_, output_names_);
-  ORT_ENFORCE(input_names_[0] == "learning_rate");  // TODO: make this better
-  ORT_ENFORCE(input_names_[1] == "step");           // TODO: make this better
+  ORT_ENFORCE(input_names_[0] == "learning_rate");        // TODO: make this better
+  ORT_ENFORCE(input_names_[1] == "step");                 // TODO: make this better
+  ORT_ENFORCE(input_names_[2] == "params");               // TODO: make this better
+  ORT_ENFORCE(input_names_[3] == "first_order_moments");  // TODO: make this better
+  ORT_ENFORCE(input_names_[4] == "second_order_moments"); // TODO: make this better
 
   if (optimizer_type_ == OptimizerType::AdamW) {
     ORT_THROW_IF_ERROR(GenerateMomentumNamedStates());

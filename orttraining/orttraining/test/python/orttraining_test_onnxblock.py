@@ -479,12 +479,15 @@ def test_adamw_optimizer_execution():
         ort_inputs = {
             "learning_rate": np.full(1, learning_rate, dtype=np.float32),
             "step": np.full(1, step, dtype=np.int64),
+            "params": [],
+            "first_order_moments": [],
+            "second_order_moments": [],
         }
         for name, param in pt_model.named_parameters():
-            ort_inputs[name] = _to_numpy(copy.deepcopy(param))
+            ort_inputs["params"].append(_to_numpy(copy.deepcopy(param)))
             ort_inputs[f"{name}_grad"] = _to_numpy(copy.deepcopy(param.grad))
-            ort_inputs[f"{name}.exp_avg"] = _to_numpy(torch.zeros_like(param))
-            ort_inputs[f"{name}.exp_avg_sq"] = _to_numpy(torch.zeros_like(param))
+            ort_inputs["first_order_moments"].append(_to_numpy(torch.zeros_like(param)))
+            ort_inputs["second_order_moments"].append(_to_numpy(torch.zeros_like(param)))
 
         # Then no error occurs when executing the model
         ort_session = onnxruntime.InferenceSession(onnx_fo.name, providers=C.get_available_providers())
